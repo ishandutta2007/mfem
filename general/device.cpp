@@ -1,4 +1,4 @@
-// Copyright (c) 2010-2023, Lawrence Livermore National Security, LLC. Produced
+// Copyright (c) 2010-2024, Lawrence Livermore National Security, LLC. Produced
 // at the Lawrence Livermore National Laboratory. All Rights reserved. See files
 // LICENSE and NOTICE for details. LLNL-CODE-806117.
 //
@@ -13,6 +13,9 @@
 #include "occa.hpp"
 #ifdef MFEM_USE_CEED
 #include "../fem/ceed/interface/util.hpp"
+#endif
+#ifdef MFEM_USE_MPI
+#include "../linalg/hypre.hpp"
 #endif
 
 #include <unordered_map>
@@ -69,9 +72,9 @@ bool Device::mem_types_set = false;
 
 Device::Device()
 {
-   if (getenv("MFEM_MEMORY") && !mem_host_env && !mem_device_env)
+   if (GetEnv("MFEM_MEMORY") && !mem_host_env && !mem_device_env)
    {
-      std::string mem_backend(getenv("MFEM_MEMORY"));
+      std::string mem_backend(GetEnv("MFEM_MEMORY"));
       if (mem_backend == "host")
       {
          mem_host_env = true;
@@ -136,9 +139,9 @@ Device::Device()
       mm.Configure(host_mem_type, device_mem_type);
    }
 
-   if (getenv("MFEM_DEVICE"))
+   if (GetEnv("MFEM_DEVICE"))
    {
-      std::string device(getenv("MFEM_DEVICE"));
+      std::string device(GetEnv("MFEM_DEVICE"));
       Configure(device);
       device_env = true;
    }
@@ -147,6 +150,9 @@ Device::Device()
 
 Device::~Device()
 {
+#ifdef MFEM_USE_MPI
+   Hypre::Finalize();
+#endif
    if ( device_env && !destroy_mm) { return; }
    if (!device_env &&  destroy_mm && !mem_host_env)
    {
@@ -250,6 +256,18 @@ void Device::Configure(const std::string &device, const int device_id)
 
    // Only '*this' will call the MemoryManager::Destroy() method.
    destroy_mm = true;
+
+#ifdef MFEM_USE_MPI
+#if defined(HYPRE_USING_GPU) && (MFEM_HYPRE_VERSION >= 23100)
+   // Skip the call to Hypre::InitDevice() if HYPRE is not initialized, e.g.
+   // * if running a serial code
+   // * if running with the environment variable MFEM_DEVICE set.
+   if (HYPRE_Initialized())
+   {
+      Hypre::InitDevice();
+   }
+#endif
+#endif
 }
 
 // static method

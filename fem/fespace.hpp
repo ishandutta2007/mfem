@@ -1,4 +1,4 @@
-// Copyright (c) 2010-2023, Lawrence Livermore National Security, LLC. Produced
+// Copyright (c) 2010-2024, Lawrence Livermore National Security, LLC. Produced
 // at the Lawrence Livermore National Laboratory. All Rights reserved. See files
 // LICENSE and NOTICE for details. LLNL-CODE-806117.
 //
@@ -265,14 +265,21 @@ protected:
    mutable Table *bdr_elem_fos; // bdr face orientations by bdr element index
    mutable Table *face_dof; // owned; in var-order space contains variant 0 DOFs
 
-   Array<int> dof_elem_array, dof_ldof_array;
+   mutable Array<int> dof_elem_array;
+   mutable Array<int> dof_ldof_array;
+   mutable Array<int> dof_bdr_elem_array;
+   mutable Array<int> dof_bdr_ldof_array;
 
    NURBSExtension *NURBSext;
+   /** array of NURBS extension for H(div) and H(curl) vector elements.
+       For each direction an extension is created from the base NURBSext,
+       with an increase in order in the appropriate direction. */
+   Array<NURBSExtension*> VNURBSext;
    int own_ext;
    mutable Array<int> face_to_be; // NURBS FE space only
 
-   Array<DofTransformation*> DoFTrans;
-   mutable VDofTransformation VDoFTrans;
+   Array<StatelessDofTransformation *> DoFTransArray;
+   mutable DofTransformation DoFTrans;
 
    /** Matrix representing the prolongation from the global conforming dofs to
        a set of intermediate partially conforming dofs, e.g. the dofs associated
@@ -328,12 +335,20 @@ protected:
    void Construct();
    void Destroy();
 
-   void ConstructDoFTrans();
-   void DestroyDoFTrans();
+   void ConstructDoFTransArray();
+   void DestroyDoFTransArray();
 
    void BuildElementToDofTable() const;
    void BuildBdrElementToDofTable() const;
    void BuildFaceToDofTable() const;
+
+   /** @brief Initialize internal data that enables the use of the methods
+    GetElementForDof() and GetLocalDofForDof(). */
+   void BuildDofToArrays_() const;
+
+   /** @brief Initialize internal data that enables the use of the methods
+      GetBdrElementForDof() and GetBdrLocalDofForDof(). */
+   void BuildDofToBdrArrays() const;
 
    /** @brief  Generates partial face_dof table for a NURBS space.
 
@@ -383,6 +398,10 @@ protected:
    int GetEntityDofs(int entity, int index, Array<int> &dofs,
                      Geometry::Type master_geom = Geometry::INVALID,
                      int variant = 0) const;
+   /// Helper to get vertex, edge or face VDOFs (entity=0,1,2 resp.).
+   int GetEntityVDofs(int entity, int index, Array<int> &dofs,
+                      Geometry::Type master_geom = Geometry::INVALID,
+                      int variant = 0) const;
 
    // Get degenerate face DOFs: see explanation in method implementation.
    int GetDegenerateFaceDofs(int index, Array<int> &dofs,
@@ -416,10 +435,10 @@ protected:
       Table* old_elem_dof; // Owned.
       Table* old_elem_fos; // Owned.
 
-      Array<DofTransformation*> old_DoFTrans;
-      mutable VDofTransformation old_VDoFTrans;
+      Array<StatelessDofTransformation*> old_DoFTransArray;
+      mutable DofTransformation old_DoFTrans;
 
-      void ConstructDoFTrans();
+      void ConstructDoFTransArray();
 
    public:
       /** Construct the operator based on the elem_dof table of the original
@@ -450,7 +469,7 @@ protected:
       DerefinementOperator(const FiniteElementSpace *f_fes,
                            const FiniteElementSpace *c_fes,
                            BilinearFormIntegrator *mass_integ);
-      virtual void Mult(const Vector &x, Vector &y) const;
+      void Mult(const Vector &x, Vector &y) const override;
       virtual ~DerefinementOperator();
    };
 
@@ -464,6 +483,11 @@ protected:
                                        const Table &coarse_elem_dof,
                                        const Table *coarse_elem_fos,
                                        const DenseTensor localP[]) const;
+
+   /* This method returns the Refinement matrix (i.e., the embedding)
+      from a coarse variable-order fes to a fine fes (after a geometric refinement) */
+   SparseMatrix *VariableOrderRefinementMatrix(const int coarse_ndofs,
+                                               const Table &coarse_elem_dof) const;
 
    void GetLocalRefinementMatrices(Geometry::Type geom,
                                    DenseTensor &localP) const;
@@ -513,6 +537,8 @@ protected:
                                                const Array<int> *perm);
 
 public:
+
+
    /** @brief Default constructor: the object is invalid until initialized using
        the method Load(). */
    FiniteElementSpace();
@@ -561,6 +587,14 @@ public:
    bool Conforming() const { return mesh->Conforming() && cP == NULL; }
    bool Nonconforming() const { return mesh->Nonconforming() || cP != NULL; }
 
+   /** Set the prolongation operator of the space to an arbitrary sparse matrix,
+       creating a copy of the argument. */
+   void SetProlongation(const SparseMatrix& p);
+
+   /** Set the restriction operator of the space to an arbitrary sparse matrix,
+       creating a copy of the argument. */
+   void SetRestriction(const SparseMatrix& r);
+
    /// Sets the order of the i'th finite element.
    /** By default, all elements are assumed to be of fec->GetOrder(). Once
        SetElementOrder is called, the space becomes a variable order space. */
@@ -576,7 +610,8 @@ public:
    /// Returns true if the space contains elements of varying polynomial orders.
    bool IsVariableOrder() const { return elem_order.Size(); }
 
-   /// The returned SparseMatrix is owned by the FiniteElementSpace.
+   /// The returned SparseMatrix is owned by the FiniteElementSpace. The method
+   /// returns nullptr if the matrix is identity.
    const SparseMatrix *GetConformingProlongation() const;
 
    /// The returned SparseMatrix is owned by the FiniteElementSpace.
@@ -589,7 +624,8 @@ public:
    /// The returned SparseMatrix is owned by the FiniteElementSpace.
    const SparseMatrix *GetHpConformingRestriction() const;
 
-   /// The returned Operator is owned by the FiniteElementSpace.
+   /// The returned Operator is owned by the FiniteElementSpace. The method
+   /// returns nullptr if the prolongation matrix is identity.
    virtual const Operator *GetProlongationMatrix() const
    { return GetConformingProlongation(); }
 
@@ -640,7 +676,10 @@ public:
    const ElementRestrictionOperator *GetElementRestriction(
       ElementDofOrdering e_ordering) const;
 
-   /// Return an Operator that converts L-vectors to E-vectors on each face.
+   /** @brief Return an Operator that converts L-vectors to E-vectors on each
+       face. */
+   /** @warning only meshes with tensor-product elements are currently
+       supported. */
    virtual const FaceRestriction *GetFaceRestriction(
       ElementDofOrdering f_ordering, FaceType,
       L2FaceValues mul = L2FaceValues::DoubleValued) const;
@@ -803,7 +842,16 @@ public:
    /// with triangular faces.
    ///
    /// @note The returned object should NOT be deleted by the caller.
-   virtual DofTransformation *GetElementDofs(int elem, Array<int> &dofs) const;
+   DofTransformation *GetElementDofs(int elem, Array<int> &dofs) const;
+
+   /// @brief The same as GetElementDofs(), but with a user-allocated
+   /// DofTransformation object. @a doftrans must be allocated in advance and
+   /// will be owned by the caller. The user can use the
+   /// DofTransformation::GetDofTransformation method on the returned
+   /// @a doftrans object to detect if the DofTransformation should actually be
+   /// used.
+   virtual void GetElementDofs(int elem, Array<int> &dofs,
+                               DofTransformation &doftrans) const;
 
    /// @brief Returns indices of degrees of freedom for boundary element 'bel'.
    /// The returned indices are offsets into an @ref ldof vector. See also
@@ -817,13 +865,16 @@ public:
    /// with triangular faces.
    ///
    /// @note The returned object should NOT be deleted by the caller.
-   virtual DofTransformation *GetBdrElementDofs(int bel,
-                                                Array<int> &dofs) const;
+   DofTransformation *GetBdrElementDofs(int bel, Array<int> &dofs) const;
 
-   /** @brief Returns indices of degrees of freedom for NURBS patch index
-    @a patch. Cartesian ordering is used, for the tensor-product degrees of
-    freedom. */
-   void GetPatchDofs(int patch, Array<int> &dofs) const;
+   /// @brief The same as GetBdrElementDofs(), but with a user-allocated
+   /// DofTransformation object. @a doftrans must be allocated in advance and
+   /// will be owned by the caller. The user can use the
+   /// DofTransformation::GetDofTransformation method on the returned
+   /// @a doftrans object to detect if the DofTransformation should actually be
+   /// used.
+   virtual void GetBdrElementDofs(int bel, Array<int> &dofs,
+                                  DofTransformation &doftrans) const;
 
    /// @brief Returns the indices of the degrees of freedom for the specified
    /// face, including the DOFs for the edges and the vertices of the face.
@@ -870,6 +921,13 @@ public:
    /// GetElementInteriorVDofs().
    void GetElementInteriorDofs(int i, Array<int> &dofs) const;
 
+   /// @brief Returns the number of degrees of freedom associated with the
+   /// interior of the specified element.
+   ///
+   /// See GetElementInteriorDofs() for more information or to obtain the
+   /// relevant indices.
+   int GetNumElementInteriorDofs(int i) const;
+
    /// @brief Returns the indices of the degrees of freedom for the interior
    /// of the specified face.
    ///
@@ -882,13 +940,6 @@ public:
    /// GetFaceInteriorVDofs().
    void GetFaceInteriorDofs(int i, Array<int> &dofs) const;
 
-   /// @brief Returns the number of degrees of freedom associated with the
-   /// interior of the specified element.
-   ///
-   /// See GetElementInteriorDofs() for more information or to obtain the
-   /// relevant indices.
-   int GetNumElementInteriorDofs(int i) const;
-
    /// @brief Returns the indices of the degrees of freedom for the interior
    /// of the specified edge.
    ///
@@ -896,6 +947,11 @@ public:
    /// GetEdgeInteriorVDofs().
    void GetEdgeInteriorDofs(int i, Array<int> &dofs) const;
    ///@}
+
+   /** @brief Returns indices of degrees of freedom for NURBS patch index
+    @a patch. Cartesian ordering is used, for the tensor-product degrees of
+    freedom. */
+   void GetPatchDofs(int patch, Array<int> &dofs) const;
 
    /// @anchor dof2vdof @name DoF To VDoF Conversion methods
    /// These methods convert between local dof and local vector dof using the
@@ -997,7 +1053,7 @@ public:
    { return (dof >= 0) ? dof : (-1 - dof); }
 
    /// Helper to determine the DOF and sign of a sign encoded DOF
-   static inline int DecodeDof(int dof, double& sign)
+   static inline int DecodeDof(int dof, real_t& sign)
    { return (dof >= 0) ? (sign = 1, dof) : (sign = -1, (-1 - dof)); }
 
    /// @anchor getvdof @name Local Vector DoF Access Members
@@ -1023,6 +1079,15 @@ public:
    /// @note The returned object should NOT be deleted by the caller.
    DofTransformation *GetElementVDofs(int i, Array<int> &vdofs) const;
 
+   /// @brief The same as GetElementVDofs(), but with a user-allocated
+   /// DofTransformation object. @a doftrans must be allocated in advance and
+   /// will be owned by the caller. The user can use the
+   /// DofTransformation::GetDofTransformation method on the returned
+   /// @a doftrans object to detect if the DofTransformation should actually be
+   /// used.
+   void GetElementVDofs(int i, Array<int> &vdofs,
+                        DofTransformation &doftrans) const;
+
    /// @brief Returns indices of degrees of freedom for @a i'th boundary
    /// element.
    /// The returned indices are offsets into an @ref ldof vector with @b vdim
@@ -1037,6 +1102,15 @@ public:
    ///
    /// @note The returned object should NOT be deleted by the caller.
    DofTransformation *GetBdrElementVDofs(int i, Array<int> &vdofs) const;
+
+   /// @brief The same as GetBdrElementVDofs(), but with a user-allocated
+   /// DofTransformation object. @a doftrans must be allocated in advance and
+   /// will be owned by the caller. The user can use the
+   /// DofTransformation::GetDofTransformation method on the returned
+   /// @a doftrans object to detect if the DofTransformation should actually be
+   /// used.
+   void GetBdrElementVDofs(int i, Array<int> &vdofs,
+                           DofTransformation &doftrans) const;
 
    /// Returns indices of degrees of freedom in @a vdofs for NURBS patch @a i.
    void GetPatchVDofs(int i, Array<int> &vdofs) const;
@@ -1110,24 +1184,34 @@ public:
    const Table &GetFaceToDofTable() const
    { if (!face_dof) { BuildFaceToDofTable(); } return *face_dof; }
 
-   /** @brief Initialize internal data that enables the use of the methods
-       GetElementForDof() and GetLocalDofForDof(). */
-   void BuildDofToArrays();
+   /// Deprecated. This function is not required to be called by the user.
+   MFEM_DEPRECATED void BuildDofToArrays() const { BuildDofToArrays_(); }
 
-   /// Return the index of the first element that contains dof @a i.
-   /** This method can be called only after setup is performed using the method
-       BuildDofToArrays(). */
-   int GetElementForDof(int i) const { return dof_elem_array[i]; }
-   /// Return the local dof index in the first element that contains dof @a i.
-   /** This method can be called only after setup is performed using the method
-       BuildDofToArrays(). */
-   int GetLocalDofForDof(int i) const { return dof_ldof_array[i]; }
+   /// Return the index of the first element that contains ldof index @a i.
+   int GetElementForDof(int i) const { BuildDofToArrays_(); return dof_elem_array[i]; }
+
+   /// Return the dof index within the element from GetElementForDof() for ldof index @a i.
+   int GetLocalDofForDof(int i) const { BuildDofToArrays_(); return dof_ldof_array[i]; }
+
+   /// Return the index of the first boundary element that contains ldof index @a i.
+   int GetBdrElementForDof(int i) const { BuildDofToBdrArrays(); return dof_bdr_elem_array[i]; }
+
+   /// Return the dof index within the boundary element from GetBdrElementForDof() for ldof index @a i.
+   int GetBdrLocalDofForDof(int i) const { BuildDofToBdrArrays(); return dof_bdr_ldof_array[i]; }
+
 
    /** @brief Returns pointer to the FiniteElement in the FiniteElementCollection
         associated with i'th element in the mesh object.
         Note: The method has been updated to abort instead of returning NULL for
         an empty partition. */
    virtual const FiniteElement *GetFE(int i) const;
+
+   /** @brief Return GetFE(0) if the local mesh is not empty; otherwise return a
+       typical FE based on the Geometry types in the global mesh.
+
+       This method can be used as a replacement for GetFE(0) that will be valid
+       even if the local mesh is empty. */
+   const FiniteElement *GetTypicalFE() const;
 
    /** @brief Returns pointer to the FiniteElement in the FiniteElementCollection
         associated with i'th boundary face in the mesh object. */
@@ -1146,6 +1230,12 @@ public:
    /// Return the trace element from element 'i' to the given 'geom_type'
    const FiniteElement *GetTraceElement(int i, Geometry::Type geom_type) const;
 
+   /// @brief Return a "typical" trace element.
+   ///
+   /// This can be used in situations where the local mesh partition may be
+   /// empty.
+   const FiniteElement *GetTypicalTraceElement() const;
+
    /** @brief Mark degrees of freedom associated with boundary elements with
        the specified boundary attributes (marked in 'bdr_attr_is_ess').
        For spaces with 'vdim' > 1, the 'component' parameter can be used
@@ -1160,7 +1250,7 @@ public:
        to restricts the marked tDOFs to the specified component. */
    virtual void GetEssentialTrueDofs(const Array<int> &bdr_attr_is_ess,
                                      Array<int> &ess_tdof_list,
-                                     int component = -1);
+                                     int component = -1) const;
 
    /** @brief Get a list of all boundary true dofs, @a boundary_dofs. For spaces
        with 'vdim' > 1, the 'component' parameter can be used to restricts the
@@ -1292,6 +1382,18 @@ public:
       Update(false);
    }
 
+   /** @brief Compute the space's node positions w.r.t. given mesh positions.
+       The function uses FiniteElement::GetNodes() to obtain the reference DOF
+       positions of each finite element.
+
+       @param[in]  mesh_nodes   Mesh positions. Assumes that it has the same
+                                topology & ordering as the mesh of the FE space,
+                                i.e, same size as this->GetMesh()->GetNodes().
+       @param[out] fes_node_pos Positions of the FE space's nodes.
+       @param[in]  fes_nodes_ordering  Ordering of fes_node_pos.     */
+   void GetNodePositions(const Vector &mesh_nodes, Vector &fes_node_pos,
+                         int fes_nodes_ordering = Ordering::byNODES) const;
+
    /// Save finite element space to output stream @a out.
    void Save(std::ostream &out) const;
 
@@ -1302,15 +1404,20 @@ public:
    virtual ~FiniteElementSpace();
 };
 
-/// @brief Return true if the mesh contains only one topology and the elements are tensor elements.
+/// @brief Return true if the mesh contains only one topology and the elements
+/// are tensor elements.
 inline bool UsesTensorBasis(const FiniteElementSpace& fes)
 {
    Mesh & mesh = *fes.GetMesh();
    const bool mixed = mesh.GetNumGeometries(mesh.Dimension()) > 1;
-   // Potential issue: empty local mesh --> no element 0.
    return !mixed &&
-          dynamic_cast<const mfem::TensorBasisElement *>(fes.GetFE(0))!=nullptr;
+          dynamic_cast<const mfem::TensorBasisElement *>(
+             fes.GetTypicalFE()) != nullptr;
 }
+
+/// @brief Return LEXICOGRAPHIC if mesh contains only one topology and the
+/// elements are tensor elements, otherwise, return NATIVE.
+ElementDofOrdering GetEVectorOrdering(const FiniteElementSpace& fes);
 
 }
 
